@@ -18,6 +18,10 @@ export interface TcpSocketPlugin {
    * and delivered to that listener. On Electron it is not: the event is dropped, so
    * attaching the listener first is the only way to see that peer.
    *
+   * Servers and clients belong to the page that opened them: when the web view starts a
+   * new page (reload, live update) they are all closed, without events (8.3.1+), so the
+   * new page can listen on the same port again.
+   *
    * On iOS the app must declare `NSLocalNetworkUsageDescription` in Info.plist,
    * otherwise iOS 14+ silently blocks local network access.
    */
@@ -72,6 +76,19 @@ export interface ConnectResult {
 export interface SendOptions {
   client: number;
   data: string;
+  /**
+   * Timeout in seconds for the whole write. A peer that does not read lets the send
+   * buffers fill up, and the write then waits for it; past the timeout the call rejects
+   * with `Send timed out` and the connection is closed (as when the peer is gone:
+   * `disconnection` fires, later calls on the client reject with `Socket closed`) —
+   * part of the data may already have been sent.
+   *
+   * 0 or not set: no limit, the write waits for as long as the peer does.
+   *
+   * default: 0
+   * @since 8.3.0
+   */
+  timeout?: number;
 }
 
 export interface ReadOptions {

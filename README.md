@@ -53,6 +53,18 @@ Accepted connections join the same pool as `connect`, so `send`, `read` and
 
 `stopListening({ server })` stops accepting; clients already accepted stay open.
 
+### Page reloads
+
+Sockets belong to the page that opened them. When the web view starts a new
+page — `location.reload()`, a live update — every client and server is closed
+(8.3.1+), without `disconnection` events: the old page's listeners are gone
+anyway. The new page starts clean and can `listen` on the same port again.
+In-app routing (`history.pushState`, hash changes) is not a new page and
+leaves the sockets alone, and so does a navigation that never happens (an
+external link the app opens in the browser instead). On Electron, a new page
+in any window showing the app's own pages counts; popups and windows showing
+websites do not.
+
 ### Reading
 
 `read` returns one recv of at most `expectLen` bytes, base64-encoded, on both
@@ -61,6 +73,26 @@ when the peer closed the connection — that close also fires `disconnection`,
 and from then on `read` / `send` on that client reject with `Socket closed`,
 so a read loop stops instead of spinning. A peer that drops is noticed on the
 next `read` / `send`; nobody watches idle clients in the background.
+
+### Sending, threads and timeouts
+
+`connect`, `send` and `read` never run on the bridge's shared thread (Android) /
+queue (iOS): a `connect` to an address that is down, or a `send` to a peer that
+stopped reading, does not hold up other plugin calls meanwhile. Sends on one
+client go out one at a time, in call order, on every platform.
+
+`send({ client, data, timeout })` (8.3.0+): with `timeout` (seconds) a write
+the peer does not drain in time rejects with `Send timed out` and the
+connection is closed — `disconnection` fires, later calls on the client reject
+with `Socket closed`; sends queued behind it on that client reject too. The
+timeout counts from the call, so a send queued behind a stuck one still
+times out. Without it (or `0`) the write waits for as long as the peer does,
+as in 8.2.
+
+A failed `accept` on a listening socket (aborted handshake, out of descriptors)
+does not end `listen` on iOS and Android: the socket retries, backing off up
+to 5 s between attempts. Only one that keeps failing for a whole minute is
+closed (logged, no event); `listen` again to recover.
 
 ### iOS: local network permission
 
@@ -98,7 +130,7 @@ That is the whole setup: the platform registers the plugin under its native
 path, so `TcpSocket` works in the renderer with no extra wiring. A plain
 `npx cap sync` skips Electron — pass the full package name.
 
-The implementation uses only Node built-ins, so `capacitor-electron vendor`
+The implementation uses only Node built-ins (and Electron itself), so `capacitor-electron vendor`
 has nothing to rebuild when packaging.
 
 Two things behave differently from mobile:
@@ -211,6 +243,10 @@ connects before the first listener is attached is not lost — its event is reta
 and delivered to that listener. On Electron it is not: the event is dropped, so
 attaching the listener first is the only way to see that peer.
 
+Servers and clients belong to the page that opened them: when the web view starts a
+new page (reload, live update) they are all closed, without events (8.3.1+), so the
+new page can listen on the same port again.
+
 On iOS the app must declare `NSLocalNetworkUsageDescription` in Info.plist,
 otherwise iOS 14+ silently blocks local network access.
 
@@ -318,10 +354,11 @@ fire it.
 
 #### SendOptions
 
-| Prop         | Type                |
-| ------------ | ------------------- |
-| **`client`** | <code>number</code> |
-| **`data`**   | <code>string</code> |
+| Prop          | Type                | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Since |
+| ------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| **`client`**  | <code>number</code> |                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |       |
+| **`data`**    | <code>string</code> |                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |       |
+| **`timeout`** | <code>number</code> | Timeout in seconds for the whole write. A peer that does not read lets the send buffers fill up, and the write then waits for it; past the timeout the call rejects with `Send timed out` and the connection is closed (as when the peer is gone: `disconnection` fires, later calls on the client reject with `Socket closed`) — part of the data may already have been sent. 0 or not set: no limit, the write waits for as long as the peer does. default: 0 | 8.3.0 |
 
 
 #### ReadResult

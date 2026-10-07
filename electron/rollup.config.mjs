@@ -10,5 +10,5 @@ export default {
       inlineDynamicImports: true,
     },
   ],
-  external: ['node:net', 'node:os'],
+  external: ['electron', 'node:net', 'node:os'],
 };

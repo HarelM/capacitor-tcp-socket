@@ -1,6 +1,8 @@
 import type { ElectronPluginContext } from '@capawesome/capacitor-electron/plugin';
-import { createConnection, createServer } from 'node:net';
-import type { Server, Socket } from 'node:net';
+import { app, webContents } from 'electron';
+import type { WebContents } from 'electron';
+import { createConnection, createServer, Socket } from 'node:net';
+import type { Server } from 'node:net';
 import { networkInterfaces } from 'node:os';
 
 import type {
@@ -21,6 +23,9 @@ const DEFAULT_PORT = 9100;
 const DEFAULT_TIMEOUT_SECONDS = 10;
 const DEFAULT_EXPECT_LEN = 1024;
 const SOCKET_CLOSED = 'Socket closed';
+const SEND_TIMED_OUT = 'Send timed out';
+/** Longest delay setTimeout takes (~24.8 days); past it Node fires after 1 ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * Unread bytes a client may buffer before the socket is paused. The kernel
@@ -29,7 +34,12 @@ const SOCKET_CLOSED = 'Socket closed';
  */
 const MAX_BUFFERED_BYTES = 256 * 1024;
 
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+/**
+ * Base64 alphabet with up to two trailing `=`; the length (a multiple of 4) is checked
+ * apart. Not a `(?:x{4})*` group: V8 backtracks through one stack frame per group and
+ * overflows the stack on a payload of a few megabytes.
+ */
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 /** Virtual, tunnel and cellular interfaces: useless to peers on the LAN. */
 const IGNORED_INTERFACE_PREFIX = /^(utun|awdl|llw|ppp|tun|tap|rmnet|docker|veth|br-|bridge)/i;
@@ -199,6 +209,7 @@ class Client {
  *
  * Client ids are indexes into `clients`, server ids indexes into `servers`: a
  * closed entry keeps its slot so ids stay stable, exactly as on iOS and Android.
+ * A closed client's slot holds `closedClient`, so the socket itself is let go.
  */
 class TcpSocketElectron {
   static readonly __capacitorElectronPlugin = {
@@ -208,10 +219,58 @@ class TcpSocketElectron {
 
   private readonly context: ElectronPluginContext;
   private readonly clients: Client[] = [];
+  /**
+   * Stand-in for a closed client: its slot keeps answering "Socket closed" (and
+   * `disconnect` stays idempotent) without holding on to the real socket.
+   */
+  private readonly closedClient: Client = closedClient();
   private readonly servers: (Server | undefined)[] = [];
+  /**
+   * Bumped by `closeAll`: a connect that started for an earlier page closes its socket
+   * instead of adding it to the pool.
+   */
+  private generation = 0;
 
   constructor(context: ElectronPluginContext) {
     this.context = context;
+    // The page that opened the sockets may start over (reload, live update) while the plugin
+    // lives on: its ids are lost, a listening socket keeps its port. Close them all with the
+    // page that owned them, as iOS and Android do.
+    for (const contents of webContents.getAllWebContents()) {
+      this.watchNavigation(contents);
+    }
+    app.on('web-contents-created', (_event, contents) => this.watchNavigation(contents));
+  }
+
+  private watchNavigation(contents: WebContents): void {
+    // The page a window shows now; `did-navigate` reports the new one.
+    let current = contents.getURL();
+    // Committed main-frame navigations only (a reload too): not one cancelled by a navigation
+    // guard (an external link opened in the browser instead), a download or a 204, after which
+    // the page stays; not in-page routing. And only when the page left was the app's own, so a
+    // popup or a window showing some website does not take the app's sockets with it.
+    contents.on('did-navigate', (_event, url) => {
+      const left = current;
+      current = url;
+      if (isAppPage(left)) {
+        this.closeAll();
+      }
+    });
+  }
+
+  /**
+   * Closes every client and server, with no events: the page they belonged to is gone. Ids
+   * are not reused, so a stale one from the old page answers "Socket closed".
+   */
+  private closeAll(): void {
+    this.generation++;
+    this.clients.forEach((client, index) => {
+      client.close();
+      this.release(index, client);
+    });
+    for (const server of this.servers) {
+      server?.close();
+    }
   }
 
   async connect(options: ConnectOptions): Promise<ConnectResult> {
@@ -221,8 +280,9 @@ class TcpSocketElectron {
     }
     const port = options.port ?? DEFAULT_PORT;
     // 0 means no timeout, as on Android.
-    const timeoutMs = Math.max(0, options.timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000;
+    const timeoutMs = Math.min(Math.max(0, options.timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000, MAX_TIMER_MS);
 
+    const pageGeneration = this.generation;
     const socket = await new Promise<Socket>((resolve, reject) => {
       const pending = createConnection({ host: ipAddress, port });
       const onTimeout = () => {
@@ -251,15 +311,44 @@ class TcpSocketElectron {
       });
     });
 
+    if (pageGeneration !== this.generation) {
+      // The page reloaded while connecting: nobody is left to use this socket.
+      socket.destroy();
+      throw new Error(SOCKET_CLOSED);
+    }
     return { client: this.addClient(socket) };
   }
 
   async send(options: SendOptions): Promise<void> {
     const { index, client } = this.openClient(options?.client);
     const data = decodeBase64(options?.data);
+    // 0 (the default) = no limit, as before. Clamped: past MAX_TIMER_MS setTimeout fires at once.
+    const timeoutMs = Math.min(Math.max(0, options?.timeout ?? 0) * 1000, MAX_TIMER_MS);
 
     await new Promise<void>((resolve, reject) => {
+      // Settled once: by the write callback, or by the timeout — whichever comes first.
+      let settled = false;
+      // The callback waits for the data to be flushed, which never happens while the
+      // peer does not read. Destroying the socket is the only way out of that.
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              if (!settled) {
+                settled = true;
+                this.peerGone(index, client);
+                reject(new Error(SEND_TIMED_OUT));
+              }
+            }, timeoutMs)
+          : undefined;
+      // A pending send must not keep the process alive on its own.
+      timer?.unref?.();
       client.socket.write(data, (error) => {
+        if (settled) {
+          // The timeout destroyed the socket and has rejected the call.
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
         if (!error) {
           resolve();
         } else if (client.isClosed) {
@@ -277,7 +366,7 @@ class TcpSocketElectron {
     const { index, client } = this.openClient(options?.client);
     const expectLen = Math.max(1, options?.expectLen ?? DEFAULT_EXPECT_LEN);
     // 0 = only what is already there.
-    const timeoutMs = Math.max(0, options?.timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000;
+    const timeoutMs = Math.min(Math.max(0, options?.timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000, MAX_TIMER_MS);
 
     return client.runExclusive(async () => {
       const deadline = Date.now() + timeoutMs;
@@ -319,6 +408,7 @@ class TcpSocketElectron {
     // Idempotent: closing a closed socket is a no-op. A read waiting on this
     // socket gets "Socket closed" from its own turn.
     client.close();
+    this.release(index, client);
     return { client: index };
   }
 
@@ -339,16 +429,25 @@ class TcpSocketElectron {
 
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => {
+        server.removeListener('close', onClose);
         // The slot of a server that never bound is freed: `stopListening` on
         // its id must report an invalid server, not a silent success.
         this.servers[serverIndex] = undefined;
         server.close();
         reject(error);
       };
+      // A page reload (closeAll) closed it before it was up: 'listening' never comes.
+      const onClose = () => {
+        server.removeListener('error', onError);
+        server.on('error', () => undefined);
+        reject(new Error(SOCKET_CLOSED));
+      };
       server.once('error', onError);
+      server.once('close', onClose);
       try {
         server.listen(port, () => {
           server.removeListener('error', onError);
+          server.removeListener('close', onClose);
           // From here on an error on the listening socket (and the one close()
           // reports when the server is already down) has nowhere to go — but
           // unhandled it would take the main process with it.
@@ -437,10 +536,49 @@ class TcpSocketElectron {
    * `disconnect` is not a peer event.
    */
   private peerGone(index: number, client: Client): void {
-    if (client.reportPeerGone()) {
+    const reported = client.reportPeerGone();
+    this.release(index, client);
+    if (reported) {
       this.context.notifyListeners('disconnection', { client: index });
     }
   }
+
+  /** Frees the slot of a closed client; in-flight calls keep their own reference to it. */
+  private release(index: number, client: Client): void {
+    if (this.clients[index] === client) {
+      this.clients[index] = this.closedClient;
+    }
+  }
+}
+
+/** A client that is closed from the start, see `TcpSocketElectron.closedClient`. */
+function closedClient(): Client {
+  const client = new Client(new Socket());
+  client.close();
+  return client;
+}
+
+/** Schemes of pages that are not the app's: it is served from its own scheme, or a dev server. */
+const WEB_SCHEMES = new Set([
+  'about',
+  'blob',
+  'chrome',
+  'chrome-extension',
+  'data',
+  'devtools',
+  'file',
+  'http',
+  'https',
+  'view-source',
+]);
+
+function isAppPage(url: string): boolean {
+  const devServerUrl = process.env.CAPACITOR_ELECTRON_DEV_SERVER_URL;
+  if (devServerUrl && url.startsWith(devServerUrl)) {
+    return true;
+  }
+  const colon = url.indexOf(':');
+  return colon > 0 && !WEB_SCHEMES.has(url.slice(0, colon).toLowerCase());
 }
 
 function decodeBase64(data: string | undefined): Buffer {
@@ -448,7 +586,7 @@ function decodeBase64(data: string | undefined): Buffer {
     throw new Error('No data provided');
   }
   const compact = data.replace(/\s/g, '');
-  if (!BASE64.test(compact)) {
+  if (compact.length % 4 !== 0 || !BASE64.test(compact)) {
     throw new Error('Invalid base64 data');
   }
   return Buffer.from(compact, 'base64');
